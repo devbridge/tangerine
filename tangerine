@@ -3,6 +3,9 @@
 export SCRIPT_DIR=$(dirname "$0")
 export CONFIG="$1"
 
+keychain_unlocked=false
+default_keychain=
+
 config ()
 {
     # A bootstrap script to run before building.
@@ -85,22 +88,6 @@ main ()
     [ "$KEYCHAIN" == True ] && reset_keychain
 }
 
-setup_keychain ()
-{
-    # Unlock Keychain
-    print_title "Unlocking Keychain"
-    if [ ! -f "$KEYCHAIN_PATH" ]
-    then
-        echo "*** Keychain File not found"
-        fail 1
-    fi
-    security list-keychains -s "$KEYCHAIN_PATH"
-    security default-keychain -d user -s "$KEYCHAIN_PATH" || fail $?
-    security unlock-keychain -p $KEYCHAIN_PASSWORD "$KEYCHAIN_PATH" || fail $?
-    security set-keychain-setting -l "$KEYCHAIN_PATH"
-    security show-keychain-info "$KEYCHAIN_PATH"
-}
-
 function uuid_from_profile
 {
     grep -aA1 UUID "$1" | grep -o "[-a-zA-Z0-9]\{36\}"
@@ -146,6 +133,118 @@ setup_profile ()
     fi
 
     cd "$WD"
+}
+
+# Generic helper for killing the script when
+# something goes wrong. It prints the error
+# message and exists with error code.
+function die
+{
+    [ $# -gt 0 ] && echo "Error: $@" >&2
+    exit 1
+}
+
+# Opens the keychain so that it can be used for code signing.
+# Keychain is set as default keychain because xcodebuild 
+# implicitly uses default keychain for code signing and does not
+# allow to explicitly define another.
+function setup_keychain
+{
+
+    echo "Setting up keychain"
+
+    if [ ! -f $KEYCHAIN_PATH ]; then
+        die "Keychain File not found"
+    fi
+
+    # Rememeber the default keychain that was set previously
+    # Here, the security will print a string like this:
+    #        "/Users/me/Library/Keychains/login.keychain"
+    # Since we want to get rid of quotes and spaces we pipe the output into two seds
+    # The first sed cuts off everything before the first quote (with quote included)
+    # The second sed cuts off everything after the second quote (with quote included)
+    default_keychain=`security default-keychain -d user | sed 's/\ *\"//' | sed 's/\".*//'`
+
+    # Reset the default keychain only if it is not so yet
+    if [ "$default_keychain" != "$KEYCHAIN_PATH" ]; then
+
+        # First, get the list of current visible keychains
+        # Here, the security will print a multiline string with like this:
+        #         "/Users/me/Library/Keychains/login.keychain"
+        #         "/Users/me/Library/Keychains/custom.keychain"
+        # Since we want to get rid of quotes and spaces we pipe the output into two seds
+        # The first sed cuts off everything before the first quote (with quote included)
+        # The second sed cuts off everything after the second quote (with quote included)
+        keychains=`security list-keychains -d user | sed 's/\ *\"//' | sed 's/\".*//'`
+
+        if [[ $keychains == *"$KEYCHAIN_PATH"* ]]; then
+
+            # Keychain was already in the list. Do not attempt to add it again
+            # Otherwise next time we list keychains, our keychain will be duplicated
+            # and to remove it you'll need to executre remove as many times as
+            # that keychain appears in the list
+            echo "$KEYCHAIN_PATH is already in the list"
+        else
+            echo "Adding $KEYCHAIN_PATH to the list of available keychains..."
+
+            # Append our new keychain to the list
+            keychains="$keychains $KEYCHAIN_PATH"
+
+            echo "Setting list of available keychains to"
+            for line in $keychains; do
+                echo $line
+            done 
+
+            # Set the keychain search list to our augmented list
+            # (This command will reset the keychains that you normally see in the sidebar of Keychain Access)
+            security list-keychains -d user -s $keychains
+        fi
+
+
+        echo "Setting default keychain to $KEYCHAIN_PATH..."
+        # Set the default keychain to our desired one
+        # This is needed because xcodebuild implicitly uses default keychain for code signing and does not
+        # allow to explicitly define another.
+        security default-keychain -d user -s "$KEYCHAIN_PATH" || die "Failed to set $KEYCHAIN_PATH as default"
+    else
+        echo "$KEYCHAIN_PATH is already the default keychain"
+    fi
+
+    # Unlock Keychain
+    echo "Unlocking Keychain..."
+    security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" || die "Failed to unlock $KEYCHAIN_PATH"
+    keychain_unlocked=true
+    echo "Keychain unlocked"
+
+    # This command assigns the setting to lock keychain when system sleeps
+    # We do not want to adjust any settings for the default keychain
+    if [ "$default_keychain" != "$KEYCHAIN_PATH" ]; then
+        echo "Updating keychain settings..."    
+        security set-keychain-setting -l "$KEYCHAIN_PATH"
+    fi
+    echo "Keychain info:"
+    output="$(security show-keychain-info $KEYCHAIN_PATH 2>&1)"
+    echo "$output"
+}
+
+# Closes the keychain if it was manipulated during the script execution.
+# This function locks the keychain and resets the default keychain to the 
+# one that has been default previously.
+function reset_keychain
+{
+    echo "Rolling back keychain state"
+
+    # Reset default keychain only if they are different
+    if [ "$default_keychain" != "$KEYCHAIN_PATH" ]; then
+
+        if [ $keychain_unlocked = true ]; then
+            echo "Locking $KEYCHAIN_PATH..."
+            security lock-keychain "$KEYCHAIN_PATH" || echo "Failed to lock $KEYCHAIN_PATH"
+        fi
+
+        echo "Resetting default keychain to $default_keychain..."
+        security default-keychain -d user -s "$default_keychain" || echo "Failed to set $default_keychain as default"
+    fi
 }
 
 setup_pods ()
@@ -215,13 +314,6 @@ export_ipa ()
     print_title "Creating IPA File"
 
     xcodebuild -exportArchive -exportFormat ipa -archivePath "$ARCHIVE_PATH" -exportPath "$IPA_PATH" -exportProvisioningProfile "$PROVISIONING_PROFILE_NAME" || fail $?;
-}
-
-reset_keychain ()
-{
-    print_title "Resetting keychain"
-    security list-keychains -d user -s "${HOME}/Library/Keychains/login.keychain"
-    security default-keychain -d user -s "${HOME}/Library/Keychains/login.keychain"
 }
 
 prepare_dsym ()
